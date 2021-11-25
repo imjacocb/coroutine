@@ -19,7 +19,7 @@
 struct coroutine;
 
 struct schedule {
-	char stack[STACK_SIZE];
+	char stack[STACK_SIZE];//共享栈
 	ucontext_t main;// 发生调度的上下文
 	int nco;  // coroutine 的数量
 	int cap;// 可支持的 coroutine 数量
@@ -34,10 +34,11 @@ struct coroutine {
 	struct schedule * sch; // 全局的 schedule 对象
 	ptrdiff_t cap; // coroutine 栈的大小
 	ptrdiff_t size; // coroutine 栈的当前大小
-	int status; // 当前的状态
+	int status; // 当前协程的状态
 	char *stack; // coroutine 保存 S->stack 中内容的栈
 };
 
+//创建协程
 struct coroutine * 
 _co_new(struct schedule *S , coroutine_func func, void *ud) {
 	struct coroutine * co = malloc(sizeof(*co));
@@ -46,11 +47,12 @@ _co_new(struct schedule *S , coroutine_func func, void *ud) {
 	co->sch = S;
 	co->cap = 0;
 	co->size = 0;
-	co->status = COROUTINE_READY;
+	co->status = COROUTINE_READY;//初始化为ready状态
 	co->stack = NULL;
 	return co;
 }
 
+//删除协程
 void
 _co_delete(struct coroutine *co) {
 	free(co->stack);  // 释放 coroutine 自己分配的 stack（C->stack)
@@ -63,28 +65,30 @@ coroutine_open(void) {
 	struct schedule *S = malloc(sizeof(*S));
 	S->nco = 0;
 	S->cap = DEFAULT_COROUTINE; // 设置为 16
-	S->running = -1;
+	S->running = -1;//初始化工作
 
      // 一个有 cap 个大小的 coroutine 指针数组
-	S->co = malloc(sizeof(struct coroutine *) * S->cap);
+	S->co = malloc(sizeof(struct coroutine *) * S->cap);//为所有协程分配空间
 	memset(S->co, 0, sizeof(struct coroutine *) * S->cap);
 	return S;
 }
 
+//删除调度器
 void 
 coroutine_close(struct schedule *S) {
 	int i;
 	for (i=0;i<S->cap;i++) {
 		struct coroutine * co = S->co[i];
 		if (co) {
-			_co_delete(co);
+			_co_delete(co);//释放每一个协程
 		}
 	}
-	free(S->co);
+	free(S->co);//释放给所有协程分配的空间
 	S->co = NULL;
-	free(S);
+	free(S);//释放调度器
 }
 
+//创建协程并加入调度器
 int 
 coroutine_new(struct schedule *S, coroutine_func func, void *ud) {
     // 创建一个 coroutine 对象
@@ -106,7 +110,7 @@ coroutine_new(struct schedule *S, coroutine_func func, void *ud) {
         // 遍历 coroutine 列表，找到一个空闲位置
         // 实际应该不需要遍历
 		for (i=0;i<S->cap;i++) {
-			int id = (i+S->nco) % S->cap;
+			int id = (i+S->nco) % S->cap; // nco是当前有的协程数量，之前的协程释放可能产生空位，所以取余
 			if (S->co[id] == NULL) {
 				S->co[id] = co;
 				++S->nco;
@@ -119,19 +123,21 @@ coroutine_new(struct schedule *S, coroutine_func func, void *ud) {
 }
 
 //mainfunc 是用来执行 coroutine 的函数
+//协程第一次执行调用的函数
 static void
 mainfunc(uint32_t low32, uint32_t hi32) {
-	uintptr_t ptr = (uintptr_t)low32 | ((uintptr_t)hi32 << 32);
+	uintptr_t ptr = (uintptr_t)low32 | ((uintptr_t)hi32 << 32);//不知道为什么拆成高低位
 	struct schedule *S = (struct schedule *)ptr;
-	int id = S->running;
+	int id = S->running;//取得当前正在执行的协程id
 	struct coroutine *C = S->co[id];
-	C->func(S,C->ud);
-	_co_delete(C);
+	C->func(S,C->ud);//调用协程绑定的函数
+	_co_delete(C);//协程已经执行完，可以清除
 	S->co[id] = NULL;
 	--S->nco;
 	S->running = -1;
 }
 
+//恢复id号协程
 void 
 coroutine_resume(struct schedule * S, int id) {
      // 获取对应 id 的 coroutine 对象
@@ -147,10 +153,10 @@ coroutine_resume(struct schedule * S, int id) {
         // 如果是从来没有执行过的 coroutine
 	case COROUTINE_READY:
 		getcontext(&C->ctx);
-		C->ctx.uc_stack.ss_sp = S->stack; // 将一直使用这个栈
-		C->ctx.uc_stack.ss_size = STACK_SIZE;
-		C->ctx.uc_link = &S->main;// 回到主函数中
-		S->running = id;
+		C->ctx.uc_stack.ss_sp = S->stack; // 将一直使用这个栈,将协程栈设置为调度器的共享栈
+		C->ctx.uc_stack.ss_size = STACK_SIZE;//设置栈容量  使用时栈顶栈底同时指向S->stack+STACK_SIZE，栈顶向下扩张
+		C->ctx.uc_link = &S->main;// 回到主函数中;将返回上下文设置为调度器的上下文，协程执行完后会返回到main上下文
+		S->running = id;//设置调度器当前运行的协程id
 		C->status = COROUTINE_RUNNING;// 将状态标记为 运行中
 		uintptr_t ptr = (uintptr_t)S;
         
@@ -177,6 +183,7 @@ coroutine_resume(struct schedule * S, int id) {
 当发生 yield 动作时，coroutine 会调用 _save_stack 将 S->stack 的内容 copy 到自己的 C->stack 上。
 当下一次获取到 CPU 时（发生 resume 动作时），则将 C->stack 上的内容 memcpy 到 S->stack 上，然后开始执行（swapcontext()
 */
+//保存共享栈到私有栈
 static void
 _save_stack(struct coroutine *C, char *top) {
     // dummy 将在 S->stack 上进行分配
@@ -197,6 +204,7 @@ _save_stack(struct coroutine *C, char *top) {
 	memcpy(C->stack, &dummy, C->size);
 }
 
+//中断协程执行
 void
 coroutine_yield(struct schedule * S) {
     // 获取当前正在执行的 coroutine id
@@ -209,10 +217,11 @@ coroutine_yield(struct schedule * S) {
 	_save_stack(C,S->stack + STACK_SIZE);
 	C->status = COROUTINE_SUSPEND;
 	S->running = -1;
-    // 保存 coroutine 的 context，切到 main
+    // 保存 coroutine 的 context，切到 main上下文
 	swapcontext(&C->ctx , &S->main);
 }
 
+//返回id号协程的状态
 int 
 coroutine_status(struct schedule * S, int id) {
 	assert(id>=0 && id < S->cap);
@@ -222,6 +231,7 @@ coroutine_status(struct schedule * S, int id) {
 	return S->co[id]->status;
 }
 
+//返回正在运行的协程id
 int 
 coroutine_running(struct schedule * S) {
 	return S->running;
